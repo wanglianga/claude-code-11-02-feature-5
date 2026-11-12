@@ -3,7 +3,7 @@ import path from 'path';
 import { getBrowser } from '../browser';
 import { env } from '../env';
 import { FlowError } from '../errors';
-import { loginFlow, setDateWindow, withElementGuard, type FlowResult, type TaskContext } from './common';
+import { loginFlow, navigate, setDateWindow, withElementGuard, type FlowResult, type TaskContext } from './common';
 
 /**
  * BETA 蓝雀到家：申请导出 → 下载中心轮询等待生成 → 下载 XLSX。
@@ -21,26 +21,26 @@ export async function betaFlow(ctx: TaskContext): Promise<FlowResult> {
     await withElementGuard(() => setDateWindow(page, ctx, 'BETA'), page, steps);
 
     // 申请导出（若下载中心已有该日期的记录则直接复用，避免重复申请）
-    await page.goto(`${env.mockBaseUrl}/BETA/downloads`, { waitUntil: 'domcontentloaded' });
+    await navigate(page, steps, `${env.mockBaseUrl}/BETA/downloads`, 'downloads', 'BETA');
     const rowSel = `tr.dl-row[data-date="${task.biz_date}"]`;
     if (!(await page.locator(rowSel).count())) {
-      await page.goto(`${env.mockBaseUrl}/BETA/report?start=${task.biz_date}&end=${task.biz_date}`, { waitUntil: 'domcontentloaded' });
+      await navigate(page, steps, `${env.mockBaseUrl}/BETA/report?start=${task.biz_date}&end=${task.biz_date}`, 'report', 'BETA');
       await withElementGuard(async () => {
         await page.fill('#start-date', task.biz_date);
         await page.fill('#end-date', task.biz_date);
         await page.click('#request-export-btn');
       }, page, steps);
       await page.waitForLoadState('domcontentloaded');
-      await steps.log('export_requested', 'ok', '已提交导出申请，等待平台生成');
+      await steps.log('export_requested', 'ok', '已提交导出申请，等待平台生成', undefined, { event: 'submit', selector: '#request-export-btn' });
     } else {
-      await steps.log('export_requested', 'info', '下载中心已存在该日期导出记录，复用（避免重复申请）');
+      await steps.log('export_requested', 'info', '下载中心已存在该日期导出记录，复用（避免重复申请）', undefined, { event: 'submit', reused: true });
     }
 
     // 轮询下载中心直到可下载
     const deadline = Date.now() + 90_000;
     let ready = false;
     while (Date.now() < deadline) {
-      await page.goto(`${env.mockBaseUrl}/BETA/downloads`, { waitUntil: 'domcontentloaded' });
+      await navigate(page, steps, `${env.mockBaseUrl}/BETA/downloads`, 'downloads', 'BETA');
       const row = page.locator(rowSel);
       if ((await row.count()) && (await row.getAttribute('data-ready')) === '1') { ready = true; break; }
       await steps.log('wait_export', 'info', '报表尚未生成，2s 后重试');
@@ -52,7 +52,7 @@ export async function betaFlow(ctx: TaskContext): Promise<FlowResult> {
       throw new FlowError('EXPORT_NOT_READY', '导出文件尚未生成（平台延迟出数）', { retryable: true, screenshot: shot });
     }
     const readyShot = await steps.shot(page, 'download_center');
-    await steps.log('export_ready', 'ok', '下载中心已可下载，截图留证', readyShot);
+    await steps.log('export_ready', 'ok', '下载中心已可下载，截图留证', readyShot, { event: 'screenshot', url: page.url() });
 
     const [download] = await Promise.all([
       page.waitForEvent('download', { timeout: 30000 }),
@@ -63,14 +63,14 @@ export async function betaFlow(ctx: TaskContext): Promise<FlowResult> {
     const abs = path.join(env.dataDir, rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     await download.saveAs(abs);
-    await steps.log('export_download', 'ok', `文件已保存 ${suggested}`);
+    await steps.log('export_download', 'ok', `文件已保存 ${suggested}`, undefined, { event: 'download', suggested });
 
     // 错误文件检测：文件名必须携带本门店与请求日期
     if (!suggested.includes(task.store_code) || !suggested.includes(task.biz_date)) {
-      await steps.log('file_verify', 'failed', `文件名 ${suggested} 与任务不符`);
+      await steps.log('file_verify', 'failed', `文件名 ${suggested} 与任务不符`, undefined, { event: 'file_verify', suggested, valid: false });
       return { absPath: abs, fileName: suggested, wrongFile: true };
     }
-    await steps.log('file_verify', 'ok', '文件名校验通过');
+    await steps.log('file_verify', 'ok', '文件名校验通过', undefined, { event: 'file_verify', suggested, valid: true });
     return { absPath: abs, fileName: suggested };
   } finally {
     await context.close().catch(() => undefined);

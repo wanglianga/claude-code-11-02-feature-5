@@ -4,7 +4,10 @@
       <template #header>
         <div class="head">
           <span>任务 {{ detail.task.store_code }} / {{ detail.task.platform_code }} / {{ detail.task.username }} / {{ detail.task.biz_date }}</span>
-          <el-button size="small" type="warning" @click="rerun">重跑任务</el-button>
+          <div>
+            <el-button size="small" type="primary" @click="$router.push(`/tasks/${detail.task.id}/replay`)">运行回放</el-button>
+            <el-button size="small" type="warning" @click="rerun">重跑任务</el-button>
+          </div>
         </div>
       </template>
       <el-descriptions :column="4" border size="small">
@@ -47,6 +50,11 @@
         <el-table-column prop="finished_at" label="结束" width="180" />
         <el-table-column prop="error_code" label="错误码" width="160" />
         <el-table-column prop="error_message" label="错误信息" show-overflow-tooltip />
+        <el-table-column label="回放" width="70">
+          <template #default="{ row }">
+            <el-button size="small" link type="primary" @click="$router.push(`/tasks/${detail.task.id}/replay?run=${row.id}`)">回放</el-button>
+          </template>
+        </el-table-column>
       </el-table>
     </el-card>
 

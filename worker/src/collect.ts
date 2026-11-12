@@ -76,6 +76,11 @@ export async function processCollect(job: { data: { taskId: string }; attemptsMa
     await setTask(taskId, 'succeeded');
     await steps.log('run_finish', 'ok', `采集完成（${reg.note}）`);
   } catch (e: any) {
+    // 失败位置：取最近一次失败步骤，写入结构化 meta 供回放定位
+    const failedStep = await one(
+      `SELECT seq, name, message, screenshot_path FROM run_steps WHERE run_id=$1 AND status='failed' ORDER BY seq DESC LIMIT 1`,
+      [runId],
+    );
     if (e instanceof FlowError && e.intervention) {
       // 安全暂停：不尝试规避验证，等待人工接管
       await q(
@@ -87,7 +92,8 @@ export async function processCollect(job: { data: { taskId: string }; attemptsMa
       }
       await finish('waiting_human', e);
       await setTask(taskId, 'waiting_human', e.message);
-      await steps.log('run_paused', 'info', `已安全暂停，等待人工接管（${e.intervention}）`);
+      await steps.log('run_paused', 'info', `已安全暂停，等待人工接管（${e.intervention}）`, undefined,
+        { event: 'error', code: e.code, message: e.message, intervention: e.intervention, failedStep });
       return;
     }
     const retryable = !(e instanceof FlowError) || e.retryable;
@@ -99,6 +105,7 @@ export async function processCollect(job: { data: { taskId: string }; attemptsMa
       throw e; // 交给 BullMQ 重试
     }
     await setTask(taskId, 'failed', (e instanceof FlowError ? `[${e.code}] ${e.message}` : String(e.message ?? e)).slice(0, 500));
-    await steps.log('run_finish', 'failed', `执行失败：${e.message}`);
+    await steps.log('run_finish', 'failed', `执行失败：${e.message}`, undefined,
+      { event: 'error', code: e instanceof FlowError ? e.code : 'UNEXPECTED', message: String(e.message ?? e), failedStep });
   }
 }

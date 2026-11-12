@@ -3,7 +3,7 @@ import path from 'path';
 import { getBrowser } from '../browser';
 import { env } from '../env';
 import { FlowError } from '../errors';
-import { loginFlow, setDateWindow, withElementGuard, type FlowResult, type TaskContext } from './common';
+import { loginFlow, navigate, setDateWindow, withElementGuard, type FlowResult, type TaskContext } from './common';
 
 /**
  * ALPHA 星团外卖：网页筛选日期 → 点击导出 → 直接下载 CSV。
@@ -20,10 +20,10 @@ export async function alphaFlow(ctx: TaskContext): Promise<FlowResult> {
     await loginFlow(page, ctx, 'ALPHA');
     await withElementGuard(() => setDateWindow(page, ctx, 'ALPHA'), page, steps);
     const reportShot = await steps.shot(page, 'report_page');
-    await steps.log('report_view', 'ok', '报表页截图留证', reportShot);
+    await steps.log('report_view', 'ok', '报表页截图留证', reportShot, { event: 'screenshot', url: page.url() });
 
     // 点击导出：只点一次，等待 下载 / 人工确认页 / 重复提交提示 任一结果
-    await steps.log('export_click', 'info', '点击导出按钮（防重复点击：仅一次）');
+    await steps.log('export_click', 'info', '点击导出按钮（防重复点击：仅一次）', undefined, { event: 'submit', selector: '#export-btn' });
     const outcome = await withElementGuard(async () => {
       const downloadP = page.waitForEvent('download', { timeout: 45000 }).then((d) => ({ kind: 'download' as const, d })).catch(() => null);
       const confirmP = page.waitForSelector('#manual-confirm-banner', { timeout: 45000 }).then(() => ({ kind: 'confirm' as const })).catch(() => null);
@@ -54,17 +54,17 @@ export async function alphaFlow(ctx: TaskContext): Promise<FlowResult> {
     const abs = path.join(env.dataDir, rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     await outcome.d.saveAs(abs);
-    await steps.log('export_download', 'ok', `文件已保存 ${suggested}`, undefined, { suggested });
+    await steps.log('export_download', 'ok', `文件已保存 ${suggested}`, undefined, { event: 'download', suggested });
     const doneShot = await steps.shot(page, 'export_done');
-    await steps.log('export_done_view', 'ok', '导出完成页面截图留证', doneShot);
+    await steps.log('export_done_view', 'ok', '导出完成页面截图留证', doneShot, { event: 'screenshot', url: page.url() });
 
     // 下载到错误文件检测：表头必须包含本门店与请求日期
     const head = fs.readFileSync(abs, 'utf8').slice(0, 400);
     if (!head.includes(`门店:${task.store_code}`) || !head.includes(`结算日:${task.biz_date}`)) {
-      await steps.log('file_verify', 'failed', '文件表头与任务门店/日期不符');
+      await steps.log('file_verify', 'failed', '文件表头与任务门店/日期不符', undefined, { event: 'file_verify', suggested, valid: false });
       return { absPath: abs, fileName: suggested, wrongFile: true };
     }
-    await steps.log('file_verify', 'ok', '文件表头校验通过');
+    await steps.log('file_verify', 'ok', '文件表头校验通过', undefined, { event: 'file_verify', suggested, valid: true });
     return { absPath: abs, fileName: suggested };
   } finally {
     await context.close().catch(() => undefined);

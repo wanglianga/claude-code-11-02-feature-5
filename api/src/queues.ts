@@ -19,3 +19,7 @@ export const parseQueue = new Queue('parse', {
   connection,
   defaultJobOptions: { attempts: 2, removeOnComplete: 100, removeOnFail: 200 },
 });
+export const replayQueue = new Queue('replay', {
+  connection,
+  defaultJobOptions: { attempts: 1, removeOnComplete: 100, removeOnFail: 200 },
+});

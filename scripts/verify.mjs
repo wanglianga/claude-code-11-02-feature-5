@@ -308,8 +308,90 @@ async function s11_domVariant() {
   ok('场景恢复后重跑成功', true);
 }
 
-/* ---------- 主流程 ---------- */
+async function s12_replay() {
+  console.log('\n■ 场景11 运行回放（隔离重放 + 两次执行差异对比）');
+  const task = await taskByKey('S002', 'ALPHA', 's002', D1);
+  const detail = await api('GET', `/tasks/${task.id}`);
+  // 最早一次成功执行（含原始下载文件）；失败执行为场景10的页面改版
+  const successRun = [...detail.runs].reverse().find((r) => r.status === 'succeeded');
+  const failRun = detail.runs.find((r) => r.status === 'failed' && r.error_code === 'ELEMENT_NOT_FOUND');
 
+  // 1. 单次执行的结构化轨迹
+  const trace = await api('GET', `/runs/${successRun.id}/trace`);
+  ok('轨迹含导航/筛选/元素/截图/下载/解析',
+    trace.navigation.length > 0 && trace.filters.length > 0 && trace.elementChecks.length > 0
+    && trace.screenshots.length > 0 && trace.downloads.length > 0 && trace.parse.length > 0,
+    `nav=${trace.navigation.length} filter=${trace.filters.length} el=${trace.elementChecks.length} shot=${trace.screenshots.length} file=${trace.downloads.length}`);
+  const failTrace = await api('GET', `/runs/${failRun.id}/trace`);
+  ok('失败位置可定位（步骤+错误码）',
+    !!failTrace.failure && failTrace.failure.error_code === 'ELEMENT_NOT_FOUND' && !!failTrace.failure.step,
+    `step=${failTrace.failure?.step?.name}`);
+
+  // 2. 回放前快照（用于验证不污染正式记录）
+  const before = {
+    run_count: detail.task.run_count,
+    files: +sql(`SELECT count(*) FROM collected_files WHERE task_id='${task.id}'`),
+    facts: +sql(`SELECT count(*) FROM daily_facts WHERE store_id=2 AND platform_id=1 AND biz_date='${D1}'`),
+    missing: (await api('GET', `/dashboard?date=${D1}`)).summary.missing,
+  };
+
+  // 3. 隔离回放（ALPHA 浏览器流程）
+  const r = await api('POST', `/runs/${successRun.id}/replay`, { mode: 'isolated' });
+  ok('回放已受理', !!r.replayId);
+  const rep = await waitFor('回放完成', async () => {
+    const d = await api('GET', `/replays/${r.replayId}`);
+    return ['succeeded', 'blocked', 'failed'].includes(d.replay.status) ? d : null;
+  }, 120000);
+  ok('回放完成且写操作被隔离拦截', rep.replay.status === 'blocked', `status=${rep.replay.status}`);
+  ok('回放步骤留痕（含截图）', rep.steps.length >= 3 && rep.steps.some((s) => s.screenshot_path), `steps=${rep.steps.length}`);
+  ok('回放请求全部带标记', rep.requests.length > 0 && rep.requests.every((x) => x.replay_tag === rep.replay.replay_tag),
+    `requests=${rep.requests.length} tag=${rep.replay.replay_tag.slice(0, 14)}…`);
+  ok('导出提交被隔离拦截(403)', rep.requests.some((x) => x.blocked && x.method === 'POST' && x.status === 403));
+  const mockLog = await (await fetch(`${MOCK}/__replay/log?replayId=${rep.replay.replay_tag}`)).json();
+  ok('模拟平台审计到被拦截的写操作', mockLog.entries.some((e) => e.blocked), `entries=${mockLog.count}`);
+
+  // 4. 不污染正式记录（任务进度/文件/事实/缺报统计）
+  const after = {
+    run_count: (await api('GET', `/tasks/${task.id}`)).task.run_count,
+    files: +sql(`SELECT count(*) FROM collected_files WHERE task_id='${task.id}'`),
+    facts: +sql(`SELECT count(*) FROM daily_facts WHERE store_id=2 AND platform_id=1 AND biz_date='${D1}'`),
+    missing: (await api('GET', `/dashboard?date=${D1}`)).summary.missing,
+  };
+  ok('回放不污染任务/文件/事实/缺报统计',
+    before.run_count === after.run_count && before.files === after.files
+    && before.facts === after.facts && before.missing === after.missing,
+    `runs ${before.run_count}→${after.run_count} files ${before.files}→${after.files} facts ${before.facts}→${after.facts} missing ${before.missing}→${after.missing}`);
+  const replayLeak = +sql(`SELECT count(*) FROM run_steps s JOIN task_runs r2 ON r2.id=s.run_id WHERE r2.task_id='${task.id}' AND s.name LIKE 'replay_%'`);
+  ok('正式执行步骤无回放污染', replayLeak === 0, `replay_steps_in_run_steps=${replayLeak}`);
+
+  // 5. GAMMA 接口回放（只读，响应留证）
+  const gTask = await taskByKey('S001', 'GAMMA', 's001g', D1);
+  const gRuns = (await api('GET', `/tasks/${gTask.id}`)).runs.filter((x) => x.status === 'succeeded');
+  const gr = await api('POST', `/runs/${gRuns[0].id}/replay`, {});
+  const grep = await waitFor('GAMMA 回放完成', async () => {
+    const d = await api('GET', `/replays/${gr.replayId}`);
+    return ['succeeded', 'blocked', 'failed'].includes(d.replay.status) ? d : null;
+  }, 60000);
+  ok('接口回放成功且响应留证', grep.replay.status === 'succeeded' && grep.steps.some((s) => s.name === 'api_saved'),
+    `status=${grep.replay.status}`);
+  ok('接口回放请求带标记', grep.requests.length > 0 && grep.requests.every((x) => x.replay_tag === grep.replay.replay_tag));
+
+  // 6. 同一任务两次执行差异对比
+  const cmp = await api('GET', `/tasks/${task.id}/replay/compare?runA=${failRun.id}&runB=${successRun.id}`);
+  ok('对比识别页面元素变化', cmp.diff.elements.some((e) => e.changed),
+    cmp.diff.elements.filter((e) => e.changed).map((e) => e.selector).join(','));
+  ok('对比识别失败位置变化', cmp.diff.failure.changed,
+    `A=${cmp.diff.failure.a?.error_code} B=${cmp.diff.failure.b?.error_code ?? '无失败'}`);
+  if (gRuns.length >= 2) {
+    const cmp2 = await api('GET', `/tasks/${gTask.id}/replay/compare?runA=${gRuns[gRuns.length - 1].id}&runB=${gRuns[0].id}`);
+    ok('对比识别下载文件变化（修订 r1→r2）', cmp2.diff.files.some((f) => f.changed),
+      cmp2.diff.files.filter((f) => f.changed).map((f) => f.file_name).join(','));
+  } else {
+    ok('对比识别下载文件变化（修订 r1→r2）', false, 'GAMMA 成功执行不足两次');
+  }
+}
+
+/* ---------- 主流程 ---------- */
 async function main() {
   console.log(`验证目标: API=${API} MOCK=${MOCK} MODE=${MODE} D1=${D1} D2=${D2}`);
   // 登录
@@ -323,7 +405,7 @@ async function main() {
 
   // 干净起点
   await fetch(`${MOCK}/__reset`, { method: 'POST' });
-  sql(`TRUNCATE mapping_issues, interventions, raw_records, parse_batches, daily_facts, collected_files, run_steps, task_runs, source_tasks`);
+  sql(`TRUNCATE mapping_issues, interventions, raw_records, parse_batches, daily_facts, collected_files, run_steps, task_runs, replay_requests, replay_steps, run_replays, source_tasks`);
   console.log('已重置场景与业务数据');
 
   await s1_normal();
@@ -336,6 +418,7 @@ async function main() {
   await s8_manualOverride();
   await s10_wrongFile();
   await s11_domVariant();
+  await s12_replay();
 
   console.log(`\n========== 验证结果: ${passed} 通过, ${failed} 失败 ==========`);
   process.exit(failed ? 1 : 0);

@@ -4,7 +4,8 @@ import { processCollect } from './collect';
 import { pool, q } from './db';
 import { env } from './env';
 import { processParse } from './parse';
-import { collectQueue, COLLECT_QUEUE, connection, PARSE_QUEUE } from './queues';
+import { processReplay } from './replay';
+import { collectQueue, COLLECT_QUEUE, connection, PARSE_QUEUE, replayQueue, REPLAY_QUEUE } from './queues';
 
 /** 崩溃恢复：把中断的 run 标记出来，重新入队未完成任务（BullMQ stalled 恢复之外的兜底） */
 async function recoverySweep() {
@@ -22,7 +23,21 @@ async function recoverySweep() {
       enqueued++;
     }
   }
-  console.log(`[worker] 崩溃恢复：中断 run=${interrupted.length}，重新入队任务=${enqueued}`);
+  // 回放恢复：中断的回放标记失败；排队中的回放重新入队（不影响正式任务）
+  const interruptedReplays = await q<{ id: string }>(
+    `UPDATE run_replays SET status='failed', error='worker 重启导致回放中断', finished_at=now() WHERE status='running' RETURNING id`,
+  );
+  const queuedReplays = await q<{ id: string }>(`SELECT id FROM run_replays WHERE status='queued'`);
+  const existingReplays = await replayQueue.getJobs(['waiting', 'active', 'delayed', 'prioritized']);
+  const replayQueued = new Set(existingReplays.map((j) => j.data.replayId));
+  let replaysEnqueued = 0;
+  for (const r of queuedReplays) {
+    if (!replayQueued.has(r.id)) {
+      await replayQueue.add('replay', { replayId: r.id });
+      replaysEnqueued++;
+    }
+  }
+  console.log(`[worker] 崩溃恢复：中断 run=${interrupted.length}，重新入队任务=${enqueued}；回放中断=${interruptedReplays.length}，回放重入队=${replaysEnqueued}`);
 }
 
 async function main() {
@@ -35,15 +50,20 @@ async function main() {
   const parseWorker = new Worker(PARSE_QUEUE, processParse as any, {
     connection, concurrency: 4, stalledInterval: 15000, maxStalledCount: 2,
   });
+  const replayWorker = new Worker(REPLAY_QUEUE, processReplay as any, {
+    connection, concurrency: 1, stalledInterval: 15000, maxStalledCount: 2,
+  });
   collectWorker.on('failed', (job, err) => console.log(`[collect] job ${job?.id} failed: ${err.message}`));
   parseWorker.on('failed', (job, err) => console.log(`[parse] job ${job?.id} failed: ${err.message}`));
+  replayWorker.on('failed', (job, err) => console.log(`[replay] job ${job?.id} failed: ${err.message}`));
   collectWorker.on('error', (e) => console.error('[collect] worker error', e));
   parseWorker.on('error', (e) => console.error('[parse] worker error', e));
-  console.log('[worker] ready: collect(concurrency=2) + parse(concurrency=4)');
+  replayWorker.on('error', (e) => console.error('[replay] worker error', e));
+  console.log('[worker] ready: collect(concurrency=2) + parse(concurrency=4) + replay(concurrency=1)');
 
   const shutdown = async () => {
     console.log('[worker] shutting down...');
-    await Promise.allSettled([collectWorker.close(), parseWorker.close()]);
+    await Promise.allSettled([collectWorker.close(), parseWorker.close(), replayWorker.close()]);
     await closeBrowser();
     await pool.end().catch(() => undefined);
     process.exit(0);

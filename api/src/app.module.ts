@@ -4,10 +4,11 @@ import { AuthController, AuthGuard } from './auth';
 import { FilesController } from './files.controller';
 import { InterventionsController } from './interventions.controller';
 import { MiscController } from './misc.controller';
+import { ReplayController } from './replay.controller';
 import { TasksController } from './tasks.controller';
 
 @Module({
-  controllers: [AuthController, TasksController, InterventionsController, FilesController, MiscController],
+  controllers: [AuthController, TasksController, InterventionsController, FilesController, MiscController, ReplayController],
   providers: [{ provide: APP_GUARD, useClass: AuthGuard }],
 })
 export class AppModule {}

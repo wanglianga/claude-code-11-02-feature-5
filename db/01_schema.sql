@@ -170,3 +170,61 @@ CREATE TABLE IF NOT EXISTS interventions (
   resolved_at    TIMESTAMPTZ,
   resolved_by    TEXT
 );
+
+-- ---------------------------------------------------------------------------
+-- 任务运行回放（隔离证据）
+-- 重要：以下三张表只保存“回放”自身的数据，绝不写入 source_tasks / task_runs /
+-- collected_files / daily_facts / parse_batches。回放请求统一带
+-- x-collector-replay-id 标记，因此不会污染采集进度与缺报统计。
+-- ---------------------------------------------------------------------------
+
+-- 一次回放：针对某个任务某次正式执行（source_run）在隔离环境中重放
+CREATE TABLE IF NOT EXISTS run_replays (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id       UUID NOT NULL REFERENCES source_tasks(id),
+  source_run_id UUID NOT NULL REFERENCES task_runs(id),
+  mode          TEXT NOT NULL DEFAULT 'isolated', -- 仅支持 isolated
+  status        TEXT NOT NULL DEFAULT 'queued',   -- queued | running | succeeded | failed | blocked
+  -- blocked：回放发现受保护操作但已被隔离拦截（不代表回放失败）
+  replay_tag    TEXT NOT NULL,                    -- 所有回放请求携带的标记
+  diff          JSONB,                            -- 回放现场与原始执行的差异
+  error         TEXT,
+  worker_id     TEXT,
+  evidence_dir  TEXT,                             -- 相对 DATA_DIR
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  started_at    TIMESTAMPTZ,
+  finished_at   TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_replays_task ON run_replays(task_id);
+CREATE INDEX IF NOT EXISTS idx_replays_source ON run_replays(source_run_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_replays_active
+  ON run_replays(source_run_id) WHERE status IN ('queued', 'running');
+
+-- 回放步骤（与正式 run_steps 结构对齐，但完全独立存储）
+CREATE TABLE IF NOT EXISTS replay_steps (
+  id              BIGSERIAL PRIMARY KEY,
+  replay_id       UUID NOT NULL REFERENCES run_replays(id),
+  seq             INT NOT NULL,
+  name            TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'ok', -- ok | failed | info | blocked
+  message         TEXT,
+  screenshot_path TEXT,
+  meta            JSONB,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_replay_steps_replay ON replay_steps(replay_id);
+
+-- 回放请求审计：每个请求都带 replay_tag，blocked 表示被隔离策略拒绝
+CREATE TABLE IF NOT EXISTS replay_requests (
+  id          BIGSERIAL PRIMARY KEY,
+  replay_id   UUID NOT NULL REFERENCES run_replays(id),
+  seq         INT NOT NULL,
+  method      TEXT NOT NULL,
+  url         TEXT NOT NULL,
+  status      INT,
+  blocked     BOOLEAN NOT NULL DEFAULT FALSE,
+  replay_tag  TEXT NOT NULL,
+  note        TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_replay_req_replay ON replay_requests(replay_id);

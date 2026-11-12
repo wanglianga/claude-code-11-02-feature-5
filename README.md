@@ -8,7 +8,7 @@
 |---|---|
 | API | TypeScript + NestJS 10 |
 | 采集 | Playwright (Chromium) + BullMQ Worker |
-| 队列 | Redis 7 + BullMQ（`collect` / `parse` 两个队列） |
+| 队列 | Redis 7 + BullMQ（`collect` / `parse` / `replay` 三个队列） |
 | 存储 | PostgreSQL（任务/执行/步骤/文件/批次/原始行/事实/异常/接管） |
 | 前端 | Vue 3 + Vite + Element Plus |
 | 验证环境 | 可复现的模拟商家后台（3 个平台）+ 确定性 CSV/XLSX/JSON 数据 |
@@ -43,7 +43,7 @@ docker compose up -d --build
 #   模拟平台   http://localhost:4500    （场景控制见下文）
 ```
 
-首次启动 postgres 容器会自动执行 `db/01_schema.sql` 与 `db/02_seed.sql`（4 门店、3 平台、13 账号）。
+首次启动 postgres 容器会自动执行 `db/01_schema.sql` 与 `db/02_seed.sql`（4 门店、3 平台、13 账号）。**已有数据卷升级**时，需手动对既有库重放一次 schema（全部语句为 `CREATE ... IF NOT EXISTS`，幂等安全）：`docker compose exec -T postgres psql -U collector -d collector -f /docker-entrypoint-initdb.d/01_schema.sql`（本地模式 `scripts/dev-up.sh` 每次启动都会重放 schema，无需额外操作）。
 
 **跑通一次采集**：登录运营台 →「今日采集看板」→ 选择日期 →「生成当日任务」→ 观察矩阵状态变化 → 点门店进入「门店日视图」查看每个指标来自哪份原始文件。
 
@@ -104,6 +104,14 @@ bash scripts/dev-down.sh
 | 8 人工补传 | 人工上传覆盖自动事实（origin=manual）；后续自动重跑不覆盖人工数据，自动文件标记 ignored_manual |
 | 9 错误文件 | 平台给错文件 → 识别 WRONG_FILE，文件保留为 rejected 证据 |
 | 10 页面改版 | 平台 DOM 改版 → 识别 ELEMENT_NOT_FOUND 并附失败现场截图 |
+| 11 运行回放 | 轨迹含导航/筛选/元素/截图/下载/解析；失败位置可定位；隔离回放写操作被 403 拦截且请求全部带标记；回放不改变任务进度/文件/事实/缺报统计；两次执行对比识别页面元素、下载文件（修订 r1→r2）与失败位置变化 |
+
+### 手工验证回放
+
+1. 任务中心 → 某任务「详情」→ 执行记录某次执行右侧「回放」，或卡片右上「运行回放」。
+2. 「执行轨迹」按步骤展示导航 URL、日期筛选条件、元素探测结果（✓/✗）、截图、下载文件（可下载）与解析批次/异常；若有失败，顶部标出失败步骤与错误码。
+3. 点「发起隔离回放」：worker 用平台签发的**只读回放会话**（不含生产账号密码）在同一模拟页面重放，提交导出被隔离策略 403 拦截，回放表格展示状态、请求标记与逐条请求审计。
+4. 「两次执行差异对比」：选择两次执行 → 对比面板标出页面元素、筛选项、下载文件（SHA256/状态/修订）、解析结果、失败位置与步骤差异（差异行高亮）。
 
 ### 手工验证路径
 
@@ -129,6 +137,8 @@ bash scripts/dev-down.sh
 | `domvariant:ALPHA=b` | 页面元素改版（id 全变） |
 | `revision:GAMMA:S001:2026-11-10=2` | 指定日期数据修订版（金额变化+新增未知类型行） |
 
+隔离回放相关端点：`POST /__replay/session`（签发只读回放会话，不接受生产凭据）、`GET /__replay/log?replayId=`（按回放标记审计请求）、`POST /__replay/*` 之外的写操作在带 `x-collector-replay-id` 标记时一律 403。
+
 数据生成是确定性的：同一 `(平台, 门店, 日期, 修订)` 永远得到相同内容；`GET /__expected?platform=&store=&date=` 返回该平台该日的期望聚合指标，验证脚本据此断言。
 
 ## 关键设计
@@ -149,6 +159,8 @@ bash scripts/dev-down.sh
 
 **证据链**：原始文件 + SHA256 + 下载时间 + 页面截图 + 执行步骤 + 解析版本（`parser.v1` / `map.<平台>.v1`）+ 入库批次，全部落库/落盘（`DATA_DIR`，compose 中为 `collector_data` 卷）。
 
+**运行回放（隔离）**：`run_replays / replay_steps / replay_requests` 三张独立表保存回放数据，**不写** `source_tasks / task_runs / collected_files / parse_batches / daily_facts`，因此回放不会推进采集进度、不会产生假文件或影响缺报统计。回放使用 `POST /__replay/session` 签发的只读会话（不校验/不使用生产账号密码）；所有回放请求带 `x-collector-replay-id` 标记，模拟平台对带标记的写操作（如导出提交）返回 403 并记入审计，必要时才回退为 `blocked` 状态（表示“已按原流程尝试但被隔离拦截”）。回放轨迹由 `run_steps.meta` 的结构化事件（`navigation / filter / element_probe / submit / download / api / file_verify / error`）派生；两次执行对比按页面元素、筛选项、下载文件、解析结果与失败位置逐项比对。
+
 ## API 摘要（前缀 `/api`，Bearer 认证）
 
 ```
@@ -160,6 +172,11 @@ GET  /tasks/:id                 任务详情（runs/files/interventions）
 POST /tasks/:id/rerun           重跑
 POST /tasks/rerun-window        重跑窗口（日期区间×门店×平台）
 GET  /runs/:id/steps            执行步骤（含截图路径）
+GET  /runs/:id/trace            单次执行结构化轨迹（导航/筛选/元素/截图/文件/解析/失败位置）
+POST /runs/:id/replay {mode}    发起隔离回放（仅 mode=isolated）
+GET  /replays?runId=&taskId=    回放列表
+GET  /replays/:id               回放详情（步骤 + 带标记请求审计）
+GET  /tasks/:id/replay/compare?runA=&runB=  同一任务两次执行差异对比
 GET  /interventions?status=     人工接管单
 POST /interventions/:id/resolve 人工已处理→恢复场景并重跑
 GET  /files /files/:id/download 文件证据
@@ -176,7 +193,7 @@ GET  /api/static/**             证据文件静态服务（原始文件/截图�
 ├── mock-platform/         # 模拟商家后台（ALPHA/BETA/GAMMA + 场景控制）
 ├── api/                   # NestJS API
 ├── worker/                # BullMQ worker：Playwright 流程 + 解析规范化
-├── web/                   # Vue 运营台
+├── web/                   # Vue 运营台（含运行回放页 RunReplayView）
 ├── scripts/dev-up.sh      # 本地开发一键启动（无 Docker）
 ├── scripts/verify.mjs     # 端到端场景验证
 └── docker-compose.yml     # 一键启动
@@ -184,7 +201,7 @@ GET  /api/static/**             证据文件静态服务（原始文件/截图�
 
 ## 验证结论（实际执行）
 
-已在无 Docker 的 Linux 沙箱（Node 22 + 用户级 PostgreSQL 15 + Redis 7 + Chromium）中以 `node scripts/verify.mjs` 完整执行场景验证：**35 项断言全部通过**（输出见下文「验证记录」）。Docker Compose 配置与本地模式使用完全相同的构建与启动命令（`npm ci` → `npm run build` → `node dist/main.js`），worker 镜像为 Playwright 官方镜像。
+已在无 Docker 的 Linux 沙箱（Node 22 + 用户级 PostgreSQL 15 + Redis 7 + Chromium）中以 `node scripts/verify.mjs` 完整执行场景验证：**50 项断言全部通过**（输出见下文「验证记录」）。Docker Compose 配置与本地模式使用完全相同的构建与启动命令（`npm ci` → `npm run build` → `node dist/main.js`），worker 镜像为 Playwright 官方镜像。
 
 ### 验证记录（最近一次完整执行）
 
@@ -199,4 +216,6 @@ GET  /api/static/**             证据文件静态服务（原始文件/截图�
 场景8 人工补传      4/4 通过（人工覆盖自动，自动不再覆盖人工）
 场景9 错误文件      3/3 通过（WRONG_FILE 识别并保留 rejected 证据）
 场景10 页面改版     3/3 通过（ELEMENT_NOT_FOUND 识别并截图）
+场景11 运行回放     15/15 通过（轨迹完整、失败可定位、隔离拦截 403、
+                              回放不污染任务/文件/事实/缺报、两次执行差异可对比）
 ```

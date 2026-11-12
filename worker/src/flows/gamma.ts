@@ -11,25 +11,25 @@ import type { FlowResult, TaskContext } from './common';
 export async function gammaFlow(ctx: TaskContext): Promise<FlowResult> {
   const { steps, task } = ctx;
   const url = `${env.mockBaseUrl}/gamma/api/daily-report?store=${task.store_code}&date=${task.biz_date}`;
-  await steps.log('api_request', 'info', url);
+  await steps.log('api_request', 'info', url, undefined, { event: 'api', method: 'GET', url });
 
   let res: Response;
   try {
     res = await fetch(url, { headers: { authorization: `Bearer ${task.api_token || ''}` } });
   } catch (e: any) {
-    await steps.log('api_request', 'failed', `网络错误：${e.message}`);
+    await steps.log('api_request', 'failed', `网络错误：${e.message}`, undefined, { event: 'api', method: 'GET', url });
     throw new FlowError('NETWORK', `接口请求失败：${e.message}`, { retryable: true });
   }
   if (res.status === 401) {
-    await steps.log('api_request', 'failed', 'Token 失效（401）');
+    await steps.log('api_request', 'failed', 'Token 失效（401）', undefined, { event: 'api', method: 'GET', url, status: 401 });
     throw new FlowError('LOGIN_EXPIRED', 'API Token 失效，需更新凭据', { intervention: 'login_expired', retryable: false });
   }
   if (res.status === 409) {
-    await steps.log('api_request', 'failed', '平台尚未出数（409）');
+    await steps.log('api_request', 'failed', '平台尚未出数（409）', undefined, { event: 'api', method: 'GET', url, status: 409 });
     throw new FlowError('EXPORT_NOT_READY', '平台延迟出数，稍后重试', { retryable: true });
   }
   if (!res.ok) {
-    await steps.log('api_request', 'failed', `HTTP ${res.status}`);
+    await steps.log('api_request', 'failed', `HTTP ${res.status}`, undefined, { event: 'api', method: 'GET', url, status: res.status });
     throw new FlowError('API_ERROR', `接口返回 HTTP ${res.status}`, { retryable: res.status >= 500 });
   }
   const body = await res.json();
@@ -39,12 +39,12 @@ export async function gammaFlow(ctx: TaskContext): Promise<FlowResult> {
   const abs = path.join(env.dataDir, rel);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, JSON.stringify(body, null, 2));
-  await steps.log('api_saved', 'ok', `接口响应已保存 ${fileName}`);
+  await steps.log('api_saved', 'ok', `接口响应已保存 ${fileName}`, undefined, { event: 'download', suggested: fileName, revision: body.revision ?? 1 });
 
   if (body.store !== task.store_code || body.bizDate !== task.biz_date) {
-    await steps.log('file_verify', 'failed', '接口数据与任务门店/日期不符');
+    await steps.log('file_verify', 'failed', '接口数据与任务门店/日期不符', undefined, { event: 'file_verify', suggested: fileName, valid: false });
     return { absPath: abs, fileName, wrongFile: true };
   }
-  await steps.log('file_verify', 'ok', '接口数据校验通过');
+  await steps.log('file_verify', 'ok', '接口数据校验通过', undefined, { event: 'file_verify', suggested: fileName, valid: true });
   return { absPath: abs, fileName };
 }

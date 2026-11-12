@@ -9,6 +9,7 @@ export const connection = {
 
 export const COLLECT_QUEUE = 'collect';
 export const PARSE_QUEUE = 'parse';
+export const REPLAY_QUEUE = 'replay';
 
 export const collectQueue = new Queue(COLLECT_QUEUE, {
   connection,
@@ -22,4 +23,8 @@ export const collectQueue = new Queue(COLLECT_QUEUE, {
 export const parseQueue = new Queue(PARSE_QUEUE, {
   connection,
   defaultJobOptions: { attempts: 2, removeOnComplete: 100, removeOnFail: 200 },
+});
+export const replayQueue = new Queue(REPLAY_QUEUE, {
+  connection,
+  defaultJobOptions: { attempts: 1, removeOnComplete: 100, removeOnFail: 200 },
 });

@@ -32,9 +32,10 @@ const TOKENS = { 'g-token-s001': 'S001', 'g-token-s002': 'S002', 'g-token-s003':
 const PASSWORD = 'pass123';
 
 const control = new Map();          // 场景开关
-const sessions = new Map();         // token -> {platform, username, store, smsPending}
+const sessions = new Map();         // token -> {platform, username, store, smsPending, replay}
 const exportTokens = new Map();     // ALPHA 导出令牌 -> {store, date, revision, wrong}
 const betaJobs = new Map();         // BETA 导出任务 -> {store, date, readyAt, revision}
+const replayLog = [];               // 隔离回放请求审计（内存，最多 500 条）
 const cget = (k, d) => (control.has(k) ? control.get(k) : d);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rid = () => crypto.randomBytes(8).toString('hex');
@@ -47,6 +48,36 @@ app.use((req, _res, next) => { // 简易 cookie
   for (const kv of (req.headers.cookie || '').split(';')) {
     const i = kv.indexOf('=');
     if (i > 0) req.cookies[kv.slice(0, i).trim()] = kv.slice(i + 1).trim();
+  }
+  next();
+});
+/**
+ * 隔离回放守卫：
+ *  - 所有回放请求必须带 x-collector-replay-id 标记；
+ *  - 带标记的写操作（POST/PUT/PATCH/DELETE）一律 403，唯一例外是申请回放专用只读会话；
+ *  - 被拒请求写入 replayLog，可通过 GET /__replay/log 审计。
+ * 这保证回放复用同一模拟页面时，绝不会对（生产）账号重复提交导出等操作。
+ */
+app.use((req, res, next) => {
+  req.replayTag = String(req.headers['x-collector-replay-id'] || '');
+  req.replayMode = String(req.headers['x-collector-replay-mode'] || '');
+  if (!req.replayTag) return next();
+  const isSessionSetup = req.method === 'POST' && req.path === '/__replay/session';
+  const isWrite = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method);
+  const blocked = isWrite && !isSessionSetup;
+  const loggable = blocked || !['GET', 'HEAD', 'OPTIONS'].includes(req.method)
+    || req.path.endsWith('/report') || req.path.endsWith('/downloads') || req.path.startsWith('/gamma/api');
+  if (loggable) {
+    replayLog.push({ replayId: req.replayTag, mode: req.replayMode || 'isolated', method: req.method,
+      path: req.path, query: req.query, blocked, at: new Date().toISOString() });
+    if (replayLog.length > 500) replayLog.splice(0, replayLog.length - 500);
+  }
+  if (blocked) {
+    return res.status(403).json({
+      error: 'replay_blocked',
+      message: '隔离回放禁止提交写操作（导出/申请等已拦截，不影响真实采集）',
+      replayId: req.replayTag, method: req.method, path: req.path,
+    });
   }
   next();
 });
@@ -66,6 +97,7 @@ function auth(platform) {
     if (!s || s.platform !== platform) return res.redirect(`/${platform}/login?expired=1`);
     if (s.smsPending && !req.path.endsWith('/sms')) return res.redirect(`/${platform}/sms`);
     req.session = s;
+    req.replaySession = !!s.replay;
     next();
   };
 }
@@ -149,6 +181,9 @@ app.get('/:platform(ALPHA|BETA)/report', (req, res, next) => auth(req.params.pla
   (req, res) => res.send(reportPage(req.params.platform, req.session.store, req.query)));
 
 app.post('/ALPHA/export', auth('ALPHA'), async (req, res) => {
+  if (req.replaySession) {
+    return res.status(403).json({ error: 'replay_blocked', message: '隔离回放会话禁止提交导出', path: '/ALPHA/export' });
+  }
   const date = (req.body || {}).start;
   if (!date) return res.status(400).send(page('错误', '<div id="export-error" class="err">缺少日期</div>'));
   if (cget('confirm:ALPHA', false)) {
@@ -187,6 +222,9 @@ app.get('/ALPHA/export/download', auth('ALPHA'), (req, res) => {
 
 /* ---------------- BETA：下载中心 XLSX ---------------- */
 app.post('/BETA/export', auth('BETA'), (req, res) => {
+  if (req.replaySession) {
+    return res.status(403).json({ error: 'replay_blocked', message: '隔离回放会话禁止提交导出申请', path: '/BETA/export' });
+  }
   const date = (req.body || {}).start;
   if (!date) return res.status(400).send(page('错误', '<div class="err">缺少日期</div>'));
   const id = rid();
@@ -243,6 +281,30 @@ app.get('/gamma/api/daily-report', async (req, res) => {
   res.json({ platform: 'GAMMA', store, bizDate: date, revision, generatedAt: new Date().toISOString(), rows });
 });
 
+/* ---------------- 隔离回放：只读会话 + 请求审计 ---------------- */
+/**
+ * 申请回放专用会话：不校验密码、不创建正式登录会话（replay=true）。
+ * 仅允许带 x-collector-replay-id 标记的调用方使用；该会话不能提交导出。
+ */
+app.post('/__replay/session', (req, res) => {
+  if (!req.replayTag) return res.status(400).json({ error: 'missing_replay_tag' });
+  const { platform, username } = req.body || {};
+  const store = (USERS[platform] || {})[username];
+  if (!store) return res.status(404).json({ error: 'replay_account_not_found', platform, username });
+  const token = rid();
+  sessions.set(token, { platform, username, store, smsPending: false, replay: true, replayId: req.replayTag });
+  res.set('Set-Cookie', `sid_${platform}=${token}; Path=/; HttpOnly`);
+  res.json({
+    ok: true, platform, username, store, replay: true, replayId: req.replayTag,
+    cookie: `sid_${platform}=${token}`,
+  });
+});
+app.get('/__replay/log', (req, res) => {
+  const replayId = String(req.query.replayId || '');
+  const rows = replayId ? replayLog.filter((e) => e.replayId === replayId) : replayLog;
+  res.json({ count: rows.length, entries: rows });
+});
+
 /* ---------------- 验证辅助与场景控制 ---------------- */
 app.get('/__expected', (req, res) => {
   const { platform, store, date } = req.query;
@@ -258,7 +320,7 @@ app.post('/__control', (req, res) => {
   res.json({ ok: true, [path]: cget(path, null) });
 });
 app.post('/__reset', (_req, res) => {
-  control.clear(); sessions.clear(); exportTokens.clear(); betaJobs.clear();
+  control.clear(); sessions.clear(); exportTokens.clear(); betaJobs.clear(); replayLog.length = 0;
   res.json({ ok: true });
 });
 app.get('/healthz', (_req, res) => res.send('ok'));
